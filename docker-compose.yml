@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  gpu-copilot:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - USE_MOCK_DATA=true
+      - FIXTURES_DIR=fixtures
+    volumes:
+      - ./fixtures:/app/fixtures:ro
+    restart: unless-stopped
+
+  # Day 2: uncomment when adding Qdrant
+  # qdrant:
+  #   image: qdrant/qdrant:latest
+  #   ports:
+  #     - "6333:6333"
+  #   volumes:
+  #     - qdrant_storage:/qdrant/storage
+
+# volumes:
+#   qdrant_storage:

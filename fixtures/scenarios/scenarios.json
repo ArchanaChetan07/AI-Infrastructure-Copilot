@@ -1,0 +1,68 @@
+{
+  "scenarios": [
+    {
+      "id": "gpu_thermal_throttle_ecc",
+      "name": "GPU thermal throttle + ECC double-bit error",
+      "description": "GPU 2 overheating causes thermal throttle, triggers uncorrectable ECC error, crashes vLLM pod with OOMKill during graceful shutdown. This is the primary demo scenario.",
+      "severity": "critical",
+      "affected_gpu": 2,
+      "node": "gpu-node-03",
+      "pod": "vllm-inference-7d9f8b-xkp2q",
+      "namespace": "ml-serving",
+      "fixture_files": {
+        "metrics": "fixtures/gpu_metrics.json",
+        "alert": "fixtures/alert_payload.json",
+        "logs": [
+          "fixtures/logs/cuda_ecc_error.txt",
+          "fixtures/logs/oom_killed.txt",
+          "fixtures/logs/node_pressure.txt"
+        ]
+      },
+      "expected_root_cause": "GPU 2 entered thermal throttle at 91°C due to sustained high load and insufficient cooling. Thermal stress triggered an uncorrectable DRAM double-bit ECC error, which caused the CUDA driver to signal cudaErrorECCUncorrectable. The vLLM process attempted graceful shutdown but exceeded its 256Gi memory limit during drain, resulting in OOMKill. GPU 2 has been drained from the scheduler.",
+      "expected_fix_category": "gpu_drain_and_reset",
+      "expected_k8s_patch": "fixtures/expected/k8s_patch_gpu_drain.yaml",
+      "timeline_minutes": 32,
+      "business_impact": "vLLM inference unavailable for ~3 minutes. 44 in-flight requests dropped. Throughput reduced by 48% for 4 minutes prior to crash."
+    },
+    {
+      "id": "gpu_memory_oom",
+      "name": "GPU out-of-memory on large batch",
+      "description": "A large batch request exceeds GPU VRAM, causing CUDA OOM. Pod crashes and restarts. No hardware fault — config issue.",
+      "severity": "high",
+      "affected_gpu": 0,
+      "node": "gpu-node-01",
+      "pod": "triton-inference-server-84cb9-wqmr4",
+      "namespace": "ml-serving",
+      "fixture_files": {
+        "metrics": "fixtures/scenarios/oom_metrics.json",
+        "alert": "fixtures/scenarios/oom_alert.json",
+        "logs": ["fixtures/logs/triton_oom.txt"]
+      },
+      "expected_root_cause": "Triton inference server received a batch request with sequence length 8192 exceeding the configured max_batch_size memory budget. CUDA OOM on GPU 0. This is a configuration issue, not hardware failure.",
+      "expected_fix_category": "config_patch",
+      "expected_k8s_patch": "fixtures/expected/k8s_patch_triton_limits.yaml",
+      "timeline_minutes": 8,
+      "business_impact": "Triton pod restarted once. 12 requests failed with 503. Model reload took 90 seconds."
+    },
+    {
+      "id": "nvlink_degraded",
+      "name": "NVLink degraded — tensor parallel slowdown",
+      "description": "Persistent NVLink errors on GPU pair 2-3 reduce tensor parallel bandwidth. No crash but latency doubles.",
+      "severity": "warning",
+      "affected_gpu": 2,
+      "node": "gpu-node-03",
+      "pod": "vllm-inference-7d9f8b-xkp2q",
+      "namespace": "ml-serving",
+      "fixture_files": {
+        "metrics": "fixtures/scenarios/nvlink_metrics.json",
+        "alert": "fixtures/scenarios/nvlink_alert.json",
+        "logs": ["fixtures/logs/nvlink_errors.txt"]
+      },
+      "expected_root_cause": "Accumulated NVLink replay errors on link 3 (GPU 2 <-> GPU 3) indicate potential physical connector issue or driver state corruption. Bandwidth reduced by ~35%. No ECC errors yet but trending toward hardware failure.",
+      "expected_fix_category": "nvlink_reset",
+      "expected_k8s_patch": "fixtures/expected/k8s_patch_nvlink_reset.yaml",
+      "timeline_minutes": 45,
+      "business_impact": "P99 inference latency increased from 450ms to 890ms. SLA breach if not resolved within 30 minutes."
+    }
+  ]
+}
