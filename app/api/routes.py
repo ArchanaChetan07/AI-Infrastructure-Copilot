@@ -260,3 +260,315 @@ async def slack_preview(scenario_id: str):
         "webhook_configured": bool(settings.slack_webhook_url),
         "preview": preview,
     }
+
+
+# ── Day 3: Alertmanager / Grafana Webhook ─────────────────────────────────────
+
+@router.post(
+    "/alert/webhook",
+    summary="Receive Alertmanager or Grafana alert webhook",
+    tags=["webhooks"],
+)
+async def alert_webhook(payload: dict):
+    """
+    Direct webhook receiver for Alertmanager and Grafana alerts.
+
+    Configure in Alertmanager as:
+      receivers:
+        - name: gpu-copilot
+          webhook_configs:
+            - url: http://gpu-copilot:8000/api/v1/alert/webhook
+
+    Automatically:
+      1. Parses the alert payload
+      2. Fetches live GPU metrics (Prometheus) or fixtures
+      3. Fetches live pod logs (Kubernetes) or fixtures
+      4. Runs the 5-node LangGraph diagnosis pipeline
+      5. Posts result to Slack
+      6. Persists to Postgres
+    """
+    from app.core.models import AlertPayload
+
+    # Normalize Grafana vs Alertmanager format
+    if "alerts" not in payload and "ruleName" in payload:
+        # Grafana unified alerting format
+        payload = _grafana_to_alertmanager(payload)
+
+    try:
+        alert = AlertPayload(**payload)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Invalid alert payload: {e}")
+
+    node = alert.commonLabels.get("node", "gpu-node-03")
+    logger.info(f"Webhook received: {alert.commonLabels.get('alertname')} on {node}")
+
+    # Fetch metrics and logs (live or fixture)
+    from app.integrations.prometheus import get_metrics_for_alert
+    from app.integrations.kubernetes import fetch_all_logs_for_alert
+    from app.core.fixtures import load_k8s_patch
+
+    metrics = await get_metrics_for_alert(alert)
+    raw_logs = await fetch_all_logs_for_alert(alert)
+    k8s_patch_template = load_k8s_patch("fixtures/expected/k8s_patch_gpu_drain.yaml")
+
+    alert_summary = (
+        f"{alert.commonAnnotations.get('summary', '')} "
+        f"Node: {node}. "
+        + (f"Pod: {alert.alerts[0].labels.pod}." if alert.alerts and alert.alerts[0].labels.pod else "")
+    )
+
+    result = await run_diagnosis(
+        scenario_id="live_webhook",
+        metrics=metrics,
+        alert_summary=alert_summary,
+        raw_logs=raw_logs,
+        k8s_patch_template=k8s_patch_template,
+    )
+    return result
+
+
+def _grafana_to_alertmanager(grafana: dict) -> dict:
+    """Convert Grafana unified alerting webhook to Alertmanager format."""
+    return {
+        "version": "4",
+        "status": "firing" if grafana.get("state") == "alerting" else "resolved",
+        "receiver": "gpu-copilot",
+        "groupLabels": {"alertname": grafana.get("ruleName", "GrafanaAlert")},
+        "commonLabels": {
+            "alertname": grafana.get("ruleName", "GrafanaAlert"),
+            "severity": grafana.get("evalMatches", [{}])[0].get("tags", {}).get("severity", "critical"),
+            "node": grafana.get("evalMatches", [{}])[0].get("tags", {}).get("instance", "unknown"),
+        },
+        "commonAnnotations": {
+            "summary": grafana.get("message", "Grafana alert fired"),
+            "description": grafana.get("ruleUrl", ""),
+        },
+        "alerts": [{
+            "status": "firing",
+            "labels": {
+                "alertname": grafana.get("ruleName", "GrafanaAlert"),
+                "severity": "critical",
+            },
+            "annotations": {"summary": grafana.get("message", "")},
+            "startsAt": "2024-01-15T14:28:00Z",
+            "fingerprint": "grafana-webhook",
+        }],
+    }
+
+
+# ── Day 3: Auto-Remediation ───────────────────────────────────────────────────
+
+@router.post(
+    "/remediate/{incident_id}",
+    summary="Execute remediation for a diagnosed incident",
+    tags=["remediation"],
+)
+async def execute_remediation(
+    incident_id: str,
+    mode: str = "dry_run",
+    patch_yaml: str | None = None,
+):
+    """
+    Execute the AI-generated K8s patch for a diagnosed incident.
+
+    Modes:
+    - `dry_run`  (default) — kubectl apply --dry-run=server, nothing changes
+    - `confirm`  — queues the patch, waits for POST /remediate/{id}/confirm
+    - `auto`     — applies immediately (CRITICAL/HIGH only)
+
+    Always safe to call with dry_run=true — shows exactly what would happen.
+    """
+    from app.services.remediation_service import (
+        RemediationMode, execute_remediation as do_remediate,
+    )
+    from app.db.database import get_incident
+
+    try:
+        rem_mode = RemediationMode(mode)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid mode '{mode}'. Use: dry_run, confirm, auto")
+
+    incident_data = await get_incident(incident_id)
+    if not incident_data and not settings.use_mock_data:
+        raise HTTPException(status_code=404, detail=f"Incident {incident_id} not found")
+
+    # Build a minimal DiagnosisResult from stored data for remediation
+    from app.core.models import DiagnosisResult, Severity, FixCategory, RemediationStep
+    from datetime import datetime, timezone
+
+    if incident_data:
+        mock_result = DiagnosisResult(
+            incident_id=incident_id,
+            scenario_id=incident_data.get("scenario_id"),
+            node=incident_data["node"],
+            affected_gpu=incident_data.get("affected_gpu"),
+            pod=incident_data.get("pod"),
+            namespace=incident_data.get("namespace"),
+            diagnosed_at=datetime.now(timezone.utc),
+            investigation_duration_seconds=0,
+            severity=Severity(incident_data["severity"]),
+            root_cause=incident_data["root_cause"],
+            contributing_factors=incident_data.get("contributing_factors", []),
+            fix_category=FixCategory(incident_data["fix_category"]),
+            remediation_steps=[],
+            k8s_patch_yaml=patch_yaml or "",
+            gpu_metrics_summary={},
+            log_snippets=[],
+            alert_summary="",
+            agent_trace=[],
+            confidence=incident_data.get("confidence", 0.9),
+        )
+    else:
+        # Demo mode — build from request params
+        mock_result = DiagnosisResult(
+            incident_id=incident_id,
+            scenario_id="demo",
+            node="gpu-node-03",
+            affected_gpu=2,
+            pod=None, namespace=None,
+            diagnosed_at=datetime.now(timezone.utc),
+            investigation_duration_seconds=0,
+            severity=Severity.CRITICAL,
+            root_cause="Demo remediation",
+            contributing_factors=[],
+            fix_category=FixCategory.GPU_DRAIN_AND_RESET,
+            remediation_steps=[],
+            k8s_patch_yaml=patch_yaml or "",
+            gpu_metrics_summary={},
+            log_snippets=[],
+            alert_summary="",
+            agent_trace=[],
+            confidence=0.9,
+        )
+
+    return await do_remediate(mock_result, rem_mode, patch_yaml)
+
+
+@router.post(
+    "/remediate/{incident_id}/confirm",
+    summary="Confirm and execute a queued remediation",
+    tags=["remediation"],
+)
+async def confirm_remediation(incident_id: str):
+    """
+    Confirm and execute a remediation previously queued with mode=confirm.
+    This is the human-in-the-loop approval step.
+    """
+    from app.services.remediation_service import confirm_remediation as do_confirm
+    return await do_confirm(incident_id)
+
+
+@router.get(
+    "/remediate/pending",
+    summary="List remediations waiting for confirmation",
+    tags=["remediation"],
+)
+async def list_pending():
+    from app.services.remediation_service import list_pending_confirmations
+    return {"pending": await list_pending_confirmations()}
+
+
+# ── Day 3: Dashboard Analytics ────────────────────────────────────────────────
+
+@router.get(
+    "/dashboard/summary",
+    summary="Ops dashboard summary — incident counts, MTTR, top nodes",
+    tags=["analytics"],
+)
+async def dashboard_summary():
+    """
+    Summary stats for the ops dashboard.
+    Returns total incidents, severity breakdown, top failing nodes, avg MTTR.
+    Uses fixture data when Postgres is disabled — always returns useful numbers.
+    """
+    from app.services.analytics_service import get_dashboard_summary
+    return await get_dashboard_summary()
+
+
+@router.get(
+    "/dashboard/mttr-trend",
+    summary="MTTR trend over time",
+    tags=["analytics"],
+)
+async def mttr_trend(days: int = 30):
+    """
+    Daily average investigation time over the past N days.
+    Shows the '40 min → 3 min' improvement curve.
+    """
+    from app.services.analytics_service import get_mttr_trend
+    return await get_mttr_trend(days)
+
+
+@router.get(
+    "/dashboard/heatmap",
+    summary="Node × fix_category failure heatmap",
+    tags=["analytics"],
+)
+async def failure_heatmap():
+    """Incident count by node and fix category — reveals problem hardware."""
+    from app.services.analytics_service import get_failure_heatmap
+    return await get_failure_heatmap()
+
+
+@router.get(
+    "/dashboard/recurrences",
+    summary="Recurring incidents — same node, same failure type",
+    tags=["analytics"],
+)
+async def recurrence_report():
+    """
+    Identify nodes with recurring failures of the same type.
+    Includes actionable recommendations per recurrence pattern.
+    """
+    from app.services.analytics_service import get_recurrence_report
+    return await get_recurrence_report()
+
+
+# ── Day 3: Live Infrastructure ────────────────────────────────────────────────
+
+@router.get(
+    "/live/metrics/{node}",
+    summary="Fetch live GPU metrics from Prometheus",
+    tags=["live"],
+)
+async def live_metrics(node: str):
+    """
+    Query real GPU metrics from Prometheus/DCGM for a given node.
+    Requires PROMETHEUS_ENABLED=true and a running Prometheus instance.
+    Falls back to fixture data when disabled.
+    """
+    from app.integrations.prometheus import fetch_live_gpu_metrics
+    try:
+        metrics = await fetch_live_gpu_metrics(node)
+        return metrics
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Prometheus unavailable: {e}")
+
+
+@router.get(
+    "/live/metrics/{node}/gpu/{gpu_id}/trends",
+    summary="GPU metric trends (temperature, utilization, ECC) over time",
+    tags=["live"],
+)
+async def gpu_trends(node: str, gpu_id: int, duration: str = "1h"):
+    """
+    Time-series trend data for a single GPU.
+    Useful for sparklines in the ops dashboard.
+    duration: 15m, 1h, 6h, 24h
+    """
+    from app.integrations.prometheus import fetch_gpu_trends
+    return await fetch_gpu_trends(node, gpu_id, duration)
+
+
+@router.get(
+    "/live/node/{node}/status",
+    summary="Live Kubernetes node GPU status",
+    tags=["live"],
+)
+async def node_status(node: str):
+    """
+    Check allocatable vs capacity GPU count on a Kubernetes node.
+    Requires K8S_ENABLED=true.
+    """
+    from app.integrations.kubernetes import get_node_gpu_status
+    return await get_node_gpu_status(node)

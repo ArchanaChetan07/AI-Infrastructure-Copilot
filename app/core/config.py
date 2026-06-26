@@ -44,5 +44,12 @@ class Settings(BaseSettings):
     kubeconfig_path: str = ""
     k8s_enabled: bool = False
 
+    # ── Auto-remediation (Day 3) ──────────────────────────────────────────────
+    remediation_default_mode: str = "dry_run"
+    remediation_auto_severity: str = "critical"
+
+    # ── Analytics (Day 3) ────────────────────────────────────────────────────
+    analytics_enabled: bool = True
+
 
 settings = Settings()

@@ -1,0 +1,24 @@
+{
+  "status": "success",
+  "data": {
+    "resultType": "vector",
+    "result": [
+      {
+        "metric": {"__name__": "dcgm_gpu_temp", "instance": "gpu-node-03:9400", "gpu": "0", "UUID": "GPU-a1b2c3d4"},
+        "value": [1705329120, "87"]
+      },
+      {
+        "metric": {"__name__": "dcgm_gpu_temp", "instance": "gpu-node-03:9400", "gpu": "1", "UUID": "GPU-b2c3d4e5"},
+        "value": [1705329120, "72"]
+      },
+      {
+        "metric": {"__name__": "dcgm_gpu_temp", "instance": "gpu-node-03:9400", "gpu": "2", "UUID": "GPU-c3d4e5f6"},
+        "value": [1705329120, "91"]
+      },
+      {
+        "metric": {"__name__": "dcgm_gpu_temp", "instance": "gpu-node-03:9400", "gpu": "3", "UUID": "GPU-d4e5f6a7"},
+        "value": [1705329120, "68"]
+      }
+    ]
+  }
+}
