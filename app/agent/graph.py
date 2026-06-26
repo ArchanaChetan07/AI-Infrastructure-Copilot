@@ -1,12 +1,14 @@
 """
-LangGraph Diagnosis Agent
-Implements a 4-node agentic graph:
+LangGraph Diagnosis Agent — Day 2
+5-node agentic graph:
 
-  fetch_context → analyze_signals → root_cause → recommend_fix
+  fetch_context → rag_retrieve → analyze_signals → root_cause → recommend_fix
 
-Each node enriches the shared AgentState dict.
-Day 1: uses mock data + direct LLM calls (no Qdrant yet).
-Day 2: adds Qdrant RAG retrieval between fetch_context and analyze_signals.
+Day 2 additions:
+  - rag_retrieve: queries Qdrant for similar past incidents (injected into LLM context)
+  - AgentState extended with similar_incidents field
+  - analyze_signals and root_cause now receive RAG context
+  - run_diagnosis triggers Slack notification + Postgres persistence post-pipeline
 """
 
 from __future__ import annotations
@@ -47,9 +49,10 @@ class AgentState(TypedDict, total=False):
     # Enriched by nodes
     metrics_summary: dict[str, Any]
     relevant_log_snippets: list[str]
+    similar_incidents: list[dict]        # Day 2: RAG results from Qdrant
     signals: dict[str, Any]
 
-    # Outputs from LLM nodes
+    # LLM outputs
     root_cause: str
     contributing_factors: list[str]
     severity: str
@@ -63,7 +66,7 @@ class AgentState(TypedDict, total=False):
     started_at: float
 
 
-# ── LLM client ───────────────────────────────────────────────────────────────
+# ── LLM ──────────────────────────────────────────────────────────────────────
 
 def _llm() -> ChatAnthropic:
     return ChatAnthropic(
@@ -75,7 +78,6 @@ def _llm() -> ChatAnthropic:
 
 
 def _call_llm(system: str, user: str) -> str:
-    """Call the LLM and return the text response."""
     client = _llm()
     response = client.invoke([
         SystemMessage(content=system),
@@ -84,12 +86,16 @@ def _call_llm(system: str, user: str) -> str:
     return response.content
 
 
+def _strip_json(text: str) -> str:
+    return text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+
 # ── Node 1: fetch_context ─────────────────────────────────────────────────────
 
 def fetch_context(state: AgentState) -> AgentState:
     """
-    Summarize raw GPU metrics into a structured signal dict.
-    In Day 2 this node also queries Qdrant for similar past incidents.
+    Summarize raw GPU metrics into a compact signal dict.
+    Extract ERROR/CRITICAL lines from log files.
     """
     logger.info("[Agent] Node: fetch_context")
     state["trace"] = state.get("trace", [])
@@ -97,9 +103,8 @@ def fetch_context(state: AgentState) -> AgentState:
     state["started_at"] = state.get("started_at", time.time())
 
     metrics: ClusterMetrics = state["metrics"]
-
-    # Build a compact metrics summary for the LLM context window
     unhealthy_gpus = [g for g in metrics.gpus if g.health != "OK"]
+
     gpu_summary = []
     for g in metrics.gpus:
         gpu_summary.append({
@@ -128,37 +133,106 @@ def fetch_context(state: AgentState) -> AgentState:
         ),
     }
 
-    # Trim logs to relevant snippets (last 30 lines of each file)
     snippets = []
     for log in state.get("raw_logs", []):
         lines = log.strip().split("\n")
-        # Prioritize ERROR / CRITICAL lines
-        critical_lines = [l for l in lines if any(kw in l for kw in ["ERROR", "CRITICAL", "WARNING", "OOMKill", "ECC"])]
-        snippets.append("\n".join(critical_lines[-20:] if critical_lines else lines[-15:]))
+        critical = [l for l in lines if any(kw in l for kw in ["ERROR", "CRITICAL", "WARNING", "OOMKill", "ECC", "NVLink", "CUDA"])]
+        snippets.append("\n".join(critical[-20:] if critical else lines[-15:]))
 
     state["relevant_log_snippets"] = snippets
+    state["similar_incidents"] = []  # populated by rag_retrieve
+
     state["trace"].append(
-        f"fetch_context: found {len(unhealthy_gpus)} unhealthy GPU(s), "
-        f"extracted {len(snippets)} log snippet(s)"
+        f"fetch_context: {len(unhealthy_gpus)} unhealthy GPU(s), {len(snippets)} log snippet(s)"
     )
     return state
 
 
-# ── Node 2: analyze_signals ───────────────────────────────────────────────────
+# ── Node 2: rag_retrieve (Day 2) ──────────────────────────────────────────────
+
+def rag_retrieve(state: AgentState) -> AgentState:
+    """
+    Query Qdrant for similar historical incidents.
+    Builds a search query from the most salient signals in the current state
+    and injects the top-k results as RAG context for subsequent LLM nodes.
+
+    Falls back gracefully if Qdrant is unavailable.
+    """
+    logger.info("[Agent] Node: rag_retrieve")
+    state["trace"].append("rag_retrieve: querying Qdrant for similar historical incidents")
+
+    # Build a query string from the most salient signals we have so far
+    metrics = state["metrics_summary"]
+    unhealthy = [g for g in metrics["gpus"] if g["health"] in ("CRITICAL", "WARNING", "UNHEALTHY")]
+
+    query_parts = []
+    for g in unhealthy:
+        if g["ecc_dbe"] > 0:
+            query_parts.append(f"GPU ECC double-bit error temp={g['temp_c']}C")
+        if g["nvlink_errors"] > 0:
+            query_parts.append(f"NVLink replay errors count={g['nvlink_errors']}")
+        if g["temp_c"] > g["throttle_threshold"]:
+            query_parts.append(f"thermal throttle temperature {g['temp_c']}C threshold {g['throttle_threshold']}C")
+        if g["mem_used_pct"] > 95:
+            query_parts.append(f"GPU memory exhaustion {g['mem_used_pct']}% used")
+
+    # Add log keywords
+    all_logs = " ".join(state.get("relevant_log_snippets", []))
+    if "OOMKill" in all_logs or "OOM" in all_logs:
+        query_parts.append("OOMKilled CUDA out of memory pod crash")
+    if "ECC" in all_logs:
+        query_parts.append("ECC uncorrectable error CUDA driver")
+
+    query = " ".join(query_parts) if query_parts else state.get("alert_summary", "GPU incident")
+
+    try:
+        import asyncio
+        from app.services.qdrant_service import retrieve_similar_incidents
+        similar = asyncio.get_event_loop().run_until_complete(
+            retrieve_similar_incidents(query, top_k=settings.rag_top_k)
+        )
+        state["similar_incidents"] = similar
+        state["trace"].append(
+            f"rag_retrieve: found {len(similar)} similar incident(s) — "
+            + ", ".join(s.get("incident_id", "?") for s in similar)
+        )
+    except Exception as e:
+        logger.warning(f"Qdrant retrieval failed (non-fatal): {e}")
+        state["similar_incidents"] = []
+        state["trace"].append(f"rag_retrieve: skipped (Qdrant unavailable: {e})")
+
+    return state
+
+
+# ── Node 3: analyze_signals ───────────────────────────────────────────────────
 
 def analyze_signals(state: AgentState) -> AgentState:
     """
-    Ask the LLM to identify which signals are anomalous and rank them.
+    LLM identifies anomalous signals, now augmented with RAG context
+    from similar historical incidents.
     """
     logger.info("[Agent] Node: analyze_signals")
-    state["trace"].append("analyze_signals: correlating metrics and log signals")
+    state["trace"].append("analyze_signals: correlating signals with RAG-augmented context")
 
     metrics_json = json.dumps(state["metrics_summary"], indent=2)
     logs_text = "\n\n---\n\n".join(state["relevant_log_snippets"])
 
+    # Format RAG context for the prompt
+    rag_context = ""
+    if state.get("similar_incidents"):
+        rag_lines = []
+        for inc in state["similar_incidents"]:
+            rag_lines.append(
+                f"[{inc.get('incident_id')} | similarity={inc.get('similarity_score', 0):.2f}] "
+                f"severity={inc.get('severity')} fix={inc.get('fix_category')}\n"
+                f"  Root cause: {inc.get('root_cause', '')[:200]}\n"
+                f"  Prevention: {inc.get('prevention', '')}"
+            )
+        rag_context = "\n\nSIMILAR PAST INCIDENTS (from Qdrant RAG):\n" + "\n\n".join(rag_lines)
+
     system = """You are an expert GPU infrastructure SRE with deep knowledge of NVIDIA GPUs,
 CUDA, Kubernetes, vLLM, and DCGM. Analyze GPU telemetry and logs to identify anomalous signals.
-Respond ONLY with a valid JSON object, no markdown, no explanation outside the JSON."""
+Use any similar past incidents to inform your analysis. Respond ONLY with valid JSON."""
 
     user = f"""Analyze these GPU cluster signals and identify the key anomalies.
 
@@ -170,6 +244,7 @@ LOG SNIPPETS:
 
 ALERT SUMMARY:
 {state.get('alert_summary', 'No alert summary provided')}
+{rag_context}
 
 Respond with this exact JSON structure:
 {{
@@ -179,33 +254,43 @@ Respond with this exact JSON structure:
   ],
   "affected_components": ["list of affected GPU IDs, pods, nodes"],
   "signal_timeline": "brief chronological description of how the signals evolved",
+  "rag_informed": true,
   "confidence": 0.0
 }}"""
 
     response = _call_llm(system, user)
-
-    # Strip markdown fences if present
-    clean = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    signals = json.loads(clean)
+    signals = json.loads(_strip_json(response))
     state["signals"] = signals
     state["trace"].append(
         f"analyze_signals: primary anomaly = '{signals.get('primary_anomaly', '')}'"
+        + (" (RAG-augmented)" if state.get("similar_incidents") else "")
     )
     return state
 
 
-# ── Node 3: root_cause ────────────────────────────────────────────────────────
+# ── Node 4: root_cause ────────────────────────────────────────────────────────
 
 def root_cause(state: AgentState) -> AgentState:
     """
-    Determine the definitive root cause from the correlated signals.
+    Determine root cause, informed by both signal analysis and RAG context.
     """
     logger.info("[Agent] Node: root_cause")
-    state["trace"].append("root_cause: determining root cause from correlated signals")
+    state["trace"].append("root_cause: determining root cause with RAG context")
+
+    rag_context = ""
+    if state.get("similar_incidents"):
+        rag_lines = []
+        for inc in state["similar_incidents"]:
+            rag_lines.append(
+                f"• [{inc.get('incident_id')}] {inc.get('root_cause', '')[:250]} "
+                f"→ fix: {inc.get('fix_category')} ({inc.get('resolution_minutes')} min)"
+            )
+        rag_context = "\n\nSIMILAR RESOLVED INCIDENTS:\n" + "\n".join(rag_lines)
 
     system = """You are a senior GPU infrastructure engineer performing root cause analysis.
-You have deep expertise in NVIDIA GPU failure modes: ECC errors, thermal throttling, NVLink failures,
-CUDA OOM, and Kubernetes scheduling. Be precise and technical. Respond ONLY with valid JSON."""
+You have deep expertise in NVIDIA GPU failure modes: ECC errors, thermal throttling, NVLink
+failures, CUDA OOM, PCIe issues, and Kubernetes scheduling. Be precise and technical.
+Respond ONLY with valid JSON."""
 
     user = f"""Perform root cause analysis for this GPU incident.
 
@@ -217,6 +302,7 @@ GPU METRICS SUMMARY:
 
 LOG SNIPPETS:
 {chr(10).join(state['relevant_log_snippets'])}
+{rag_context}
 
 Respond with this exact JSON structure:
 {{
@@ -225,12 +311,12 @@ Respond with this exact JSON structure:
   "severity": "critical|high|warning|info",
   "fix_category": "gpu_drain_and_reset|config_patch|nvlink_reset|pod_restart|node_drain|manual_intervention",
   "confidence": 0.0,
-  "business_impact": "one sentence on user-facing impact"
+  "business_impact": "one sentence on user-facing impact",
+  "similar_incident_ids": ["INC-... if RAG informed this conclusion"]
 }}"""
 
     response = _call_llm(system, user)
-    clean = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    rca = json.loads(clean)
+    rca = json.loads(_strip_json(response))
 
     state["root_cause"] = rca["root_cause"]
     state["contributing_factors"] = rca["contributing_factors"]
@@ -239,22 +325,36 @@ Respond with this exact JSON structure:
     state["confidence"] = rca.get("confidence", 0.85)
     state["trace"].append(
         f"root_cause: {rca['severity'].upper()} — {rca['fix_category']}"
+        + (f" (informed by {rca.get('similar_incident_ids', [])})" if rca.get("similar_incident_ids") else "")
     )
     return state
 
 
-# ── Node 4: recommend_fix ─────────────────────────────────────────────────────
+# ── Node 5: recommend_fix ─────────────────────────────────────────────────────
 
 def recommend_fix(state: AgentState) -> AgentState:
     """
-    Generate step-by-step remediation and a Kubernetes patch YAML.
+    Generate step-by-step runbook and Kubernetes patch YAML.
+    Past incident remediation steps are injected as reference examples.
     """
     logger.info("[Agent] Node: recommend_fix")
     state["trace"].append("recommend_fix: generating remediation steps and K8s patch")
 
-    system = """You are a Kubernetes and GPU infrastructure expert. Generate precise, 
-executable remediation steps and Kubernetes patch YAML. Be specific with kubectl commands.
-Respond ONLY with valid JSON."""
+    rag_examples = ""
+    if state.get("similar_incidents"):
+        examples = []
+        for inc in state["similar_incidents"][:2]:
+            steps = inc.get("remediation_steps", [])
+            if steps:
+                examples.append(
+                    f"[{inc.get('incident_id')} — {inc.get('fix_category')}]:\n"
+                    + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(steps))
+                )
+        if examples:
+            rag_examples = "\n\nSIMILAR PAST REMEDIATION STEPS (use as reference):\n" + "\n\n".join(examples)
+
+    system = """You are a Kubernetes and GPU infrastructure expert. Generate precise, executable
+remediation steps and Kubernetes patch YAML. Use exact kubectl commands. Respond ONLY with valid JSON."""
 
     user = f"""Generate remediation for this GPU incident.
 
@@ -264,27 +364,28 @@ SEVERITY: {state['severity']}
 AFFECTED NODE: {state['metrics_summary']['node']}
 ANOMALOUS SIGNALS: {json.dumps(state['signals'].get('anomalous_signals', []), indent=2)}
 
-EXISTING K8S PATCH TEMPLATE (use as reference):
+K8S PATCH TEMPLATE:
 {state.get('k8s_patch_template', 'No template provided')}
+{rag_examples}
 
 Respond with this exact JSON structure:
 {{
   "remediation_steps": [
     {{"step": 1, "action": "action name", "command": "kubectl command or null", "description": "what this does and why"}}
   ],
-  "k8s_patch_yaml": "complete multi-document YAML patch as a string",
+  "k8s_patch_yaml": "complete multi-document YAML as a string",
   "estimated_resolution_minutes": 0,
   "prevention": "one sentence on how to prevent this in future"
 }}"""
 
     response = _call_llm(system, user)
-    clean = response.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-    fix = json.loads(clean)
+    fix = json.loads(_strip_json(response))
 
     state["remediation_steps"] = fix["remediation_steps"]
     state["k8s_patch_yaml"] = fix.get("k8s_patch_yaml", state.get("k8s_patch_template", ""))
     state["trace"].append(
-        f"recommend_fix: generated {len(fix['remediation_steps'])} remediation steps"
+        f"recommend_fix: {len(fix['remediation_steps'])} steps, "
+        f"est. {fix.get('estimated_resolution_minutes', '?')} min resolution"
     )
     return state
 
@@ -295,12 +396,14 @@ def build_graph() -> StateGraph:
     graph = StateGraph(AgentState)
 
     graph.add_node("fetch_context", fetch_context)
+    graph.add_node("rag_retrieve", rag_retrieve)
     graph.add_node("analyze_signals", analyze_signals)
     graph.add_node("root_cause", root_cause)
     graph.add_node("recommend_fix", recommend_fix)
 
     graph.set_entry_point("fetch_context")
-    graph.add_edge("fetch_context", "analyze_signals")
+    graph.add_edge("fetch_context", "rag_retrieve")
+    graph.add_edge("rag_retrieve", "analyze_signals")
     graph.add_edge("analyze_signals", "root_cause")
     graph.add_edge("root_cause", "recommend_fix")
     graph.add_edge("recommend_fix", END)
@@ -318,7 +421,8 @@ async def run_diagnosis(
     k8s_patch_template: str = "",
 ) -> DiagnosisResult:
     """
-    Run the full LangGraph diagnosis pipeline and return a structured result.
+    Run the full 5-node LangGraph pipeline and return a DiagnosisResult.
+    Post-pipeline: saves to Postgres, notifies Slack, upserts into Qdrant.
     """
     started = time.time()
     incident_id = f"INC-{datetime.now(timezone.utc).strftime('%Y%m%d')}-{str(uuid.uuid4())[:8].upper()}"
@@ -337,7 +441,6 @@ async def run_diagnosis(
     }
 
     final_state = graph.invoke(initial_state)
-
     duration = time.time() - started
     logger.info(f"Diagnosis {incident_id} complete in {duration:.2f}s")
 
@@ -348,15 +451,10 @@ async def run_diagnosis(
             affected_gpu = g.gpu_id
             break
 
-    # Parse alert for pod/namespace
-    pod = None
-    namespace = None
-    if "pod" in alert_summary.lower():
-        # Extract from alert summary in a real implementation
-        pod = "vllm-inference-7d9f8b-xkp2q"
-        namespace = "ml-serving"
+    # Extract pod/namespace from alert summary
+    pod, namespace = _extract_pod_info(alert_summary)
 
-    return DiagnosisResult(
+    result = DiagnosisResult(
         incident_id=incident_id,
         scenario_id=scenario_id,
         node=metrics.node,
@@ -378,4 +476,74 @@ async def run_diagnosis(
         alert_summary=alert_summary,
         agent_trace=final_state.get("trace", []),
         confidence=final_state.get("confidence", 0.85),
+        similar_incidents=final_state.get("similar_incidents", []),
     )
+
+    # ── Post-pipeline side effects ────────────────────────────────────────────
+    await _post_pipeline(result)
+
+    return result
+
+
+async def _post_pipeline(result: DiagnosisResult) -> None:
+    """Run post-pipeline side effects concurrently: Slack + Postgres + Qdrant upsert."""
+    import asyncio
+
+    tasks = []
+
+    # 1. Slack notification
+    from app.services.slack_service import notify_slack
+    tasks.append(notify_slack(result))
+
+    # 2. Postgres persistence
+    from app.db.database import save_incident
+    tasks.append(save_incident(result))
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Update slack_notified flag
+    if isinstance(results[0], bool) and results[0]:
+        result.slack_notified = True
+
+    # 3. Qdrant upsert (learn from this new incident)
+    try:
+        from app.services.qdrant_service import upsert_incident
+        incident_text = (
+            f"severity={result.severity.value} fix={result.fix_category.value} "
+            f"node={result.node} root_cause={result.root_cause} "
+            f"factors={' '.join(result.contributing_factors)}"
+        )
+        await upsert_incident(
+            incident_id=result.incident_id,
+            text=incident_text,
+            payload={
+                "incident_id": result.incident_id,
+                "severity": result.severity.value,
+                "fix_category": result.fix_category.value,
+                "root_cause": result.root_cause,
+                "contributing_factors": result.contributing_factors,
+                "remediation_steps": [s.command for s in result.remediation_steps if s.command],
+                "resolution_minutes": round(result.investigation_duration_seconds / 60, 1),
+                "node": result.node,
+                "pod": result.pod or "",
+            },
+        )
+    except Exception as e:
+        logger.warning(f"Qdrant upsert failed (non-fatal): {e}")
+
+
+def _extract_pod_info(alert_summary: str) -> tuple[str | None, str | None]:
+    """Extract pod and namespace from alert summary string."""
+    pod, namespace = None, None
+    parts = alert_summary.lower()
+    if "pod:" in parts:
+        try:
+            pod = alert_summary.split("Pod:")[1].split(".")[0].strip()
+        except Exception:
+            pass
+    if "namespace:" in parts:
+        try:
+            namespace = alert_summary.split("Namespace:")[1].split(".")[0].strip()
+        except Exception:
+            pass
+    return pod, namespace

@@ -175,6 +175,12 @@ class DiagnosisResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     slack_notified: bool = False
 
+    # Day 2: RAG context
+    similar_incidents: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Similar historical incidents retrieved from Qdrant RAG",
+    )
+
 
 # ── Health / Status ───────────────────────────────────────────────────────────
 

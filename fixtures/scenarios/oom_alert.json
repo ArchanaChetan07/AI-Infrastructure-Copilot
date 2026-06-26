@@ -1,0 +1,46 @@
+{
+  "version": "4",
+  "groupKey": "{}:{alertname=\"GPUTemperatureCritical\"}",
+  "truncatedAlerts": 0,
+  "status": "firing",
+  "receiver": "gpu-copilot-webhook",
+  "groupLabels": {
+    "alertname": "GPUTemperatureCritical"
+  },
+  "commonLabels": {
+    "alertname": "GPUTemperatureCritical",
+    "cluster": "gpu-cluster-prod-01",
+    "node": "gpu-node-03",
+    "severity": "critical",
+    "team": "ml-infra"
+  },
+  "commonAnnotations": {
+    "summary": "GPU temperature exceeded shutdown threshold",
+    "description": "GPU 2 on node gpu-node-03 has reached 91°C, above the 90°C slowdown threshold. NVLink errors detected. Workload throughput reduced by 48%."
+  },
+  "externalURL": "http://alertmanager.internal:9093",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "GPUTemperatureCritical",
+        "cluster": "gpu-cluster-prod-01",
+        "node": "gpu-node-03",
+        "gpu_id": "2",
+        "gpu_uuid": "GPU-c3d4e5f6-a7b8-9012-cdef-123456789012",
+        "severity": "critical",
+        "namespace": "ml-serving",
+        "pod": "vllm-inference-7d9f8b-xkp2q"
+      },
+      "annotations": {
+        "summary": "GPU 2 temperature critical: 91°C",
+        "description": "GPU 2 on gpu-node-03 is throttling. Temperature: 91°C (threshold: 90°C). NVLink errors: 2. SM clock reduced from 1410 MHz to 1095 MHz. Fan at 100%.",
+        "runbook_url": "https://wiki.internal/runbooks/gpu-temperature-critical"
+      },
+      "startsAt": "2024-01-15T14:28:00Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "http://prometheus.internal:9090/graph?g0.expr=dcgm_gpu_temp%7Bgpu_id%3D%222%22%7D+%3E+90",
+      "fingerprint": "a1b2c3d4e5f67890"
+    }
+  ]
+}

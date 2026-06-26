@@ -1,26 +1,27 @@
-# Core
+# ── Core API ──────────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
 pydantic==2.10.2
 pydantic-settings==2.6.1
 
-# LLM + Agent
+# ── LLM + Agent ───────────────────────────────────────────────────────────────
 anthropic==0.40.0
 langchain-anthropic==0.3.1
 langchain-core==0.3.24
 langgraph==0.2.59
 
-# Vector DB (Day 2)
+# ── Day 2: Qdrant RAG ─────────────────────────────────────────────────────────
 qdrant-client==1.12.1
+sentence-transformers==3.3.1     # local embeddings — all-MiniLM-L6-v2
 
-# Database (Day 2)
+# ── Day 2: PostgreSQL ─────────────────────────────────────────────────────────
 asyncpg==0.30.0
 sqlalchemy[asyncio]==2.0.36
 
-# HTTP client
-httpx==0.28.0
+# ── Day 2: Slack + HTTP ───────────────────────────────────────────────────────
+aiohttp==3.11.10
 
-# Testing
+# ── Testing ───────────────────────────────────────────────────────────────────
 pytest==8.3.4
 pytest-asyncio==0.24.0
 httpx==0.28.0
