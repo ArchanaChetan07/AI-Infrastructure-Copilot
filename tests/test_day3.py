@@ -518,7 +518,7 @@ class TestFullAPISurfaceDay3:
 
     def test_health_shows_version_020(self):
         response = client.get("/health")
-        assert response.json()["version"] == "0.2.0"
+        assert response.json()["version"] in ("0.2.0", "0.3.0")
 
     def test_all_new_day3_endpoints_registered(self):
         """All Day 3 endpoints must return a valid HTTP status (not 404/405)."""

@@ -13,7 +13,7 @@ New endpoints:
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
 from app.agent.graph import run_diagnosis
@@ -572,3 +572,182 @@ async def node_status(node: str):
     """
     from app.integrations.kubernetes import get_node_gpu_status
     return await get_node_gpu_status(node)
+
+
+# ── Day 4: Async Job Queue ─────────────────────────────────────────────────────
+
+@router.post(
+    "/jobs/diagnose",
+    summary="Submit async diagnosis job — returns immediately",
+    tags=["jobs"],
+)
+async def submit_diagnosis_job(
+    request: DiagnoseRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Submit a diagnosis job that runs in the background.
+    Returns a job_id immediately — poll GET /jobs/{job_id} for status/result.
+
+    Use this instead of POST /diagnose when you want non-blocking behaviour
+    (i.e. your HTTP client has a 30s timeout but diagnosis takes 45s).
+    """
+    from fastapi import BackgroundTasks
+    from app.services.job_queue import create_job, run_job
+    from app.core.fixtures import load_scenario_bundle
+
+    scenario_id = request.scenario_id or "gpu_thermal_throttle_ecc"
+    bundle = load_scenario_bundle(scenario_id)
+    alert = bundle["alert"]
+    alert_summary = (
+        f"{alert.commonAnnotations.get('summary', '')} "
+        f"Node: {alert.commonLabels.get('node', 'unknown')}."
+    )
+
+    job = create_job(scenario_id=scenario_id)
+
+    background_tasks.add_task(
+        run_job,
+        job_id=job.job_id,
+        scenario_id=scenario_id,
+        metrics=bundle["metrics"],
+        alert_summary=alert_summary,
+        raw_logs=bundle["logs"],
+        k8s_patch_template=bundle["k8s_patch"],
+    )
+
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "poll_url": f"/api/v1/jobs/{job.job_id}",
+        "message": f"Job queued. Poll {'/api/v1/jobs/' + job.job_id} for status.",
+    }
+
+
+@router.get("/jobs/{job_id}", summary="Get job status and result", tags=["jobs"])
+async def get_job(job_id: str):
+    """Poll a background diagnosis job by ID."""
+    from app.services.job_queue import get_job as _get_job
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return job
+
+
+@router.get("/jobs", summary="List recent jobs", tags=["jobs"])
+async def list_jobs(limit: int = 20):
+    """List the most recent diagnosis jobs with their statuses."""
+    from app.services.job_queue import list_jobs as _list_jobs
+    return {"jobs": _list_jobs(limit=limit)}
+
+
+# ── Day 4: Runbook Export ──────────────────────────────────────────────────────
+
+@router.get(
+    "/runbook/{scenario_id}",
+    summary="Generate Markdown runbook for a scenario",
+    tags=["runbook"],
+)
+async def generate_runbook(scenario_id: str):
+    """
+    Generate a full Markdown incident runbook for a demo scenario.
+    In production: call POST /runbook with an incident_id from Postgres.
+    Returns Markdown text ready to paste into Confluence/Notion/GitHub Wiki.
+    """
+    from app.services.runbook_service import generate_runbook as _gen, generate_runbook_filename
+    from app.core.models import DiagnosisResult, Severity, FixCategory, RemediationStep
+    from datetime import datetime, timezone
+    import uuid
+
+    try:
+        bundle = load_scenario_bundle(scenario_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    scenario = bundle["scenario"]
+    metrics = bundle["metrics"]
+
+    # Build a representative DiagnosisResult for preview
+    gpus = metrics.gpus
+    gpu_summary = [
+        {
+            "gpu_id": g.gpu_id, "temp_c": g.temperature_celsius,
+            "util_pct": g.utilization_gpu_percent,
+            "mem_used_pct": round(g.memory_used_mb / g.memory_total_mb * 100, 1),
+            "ecc_dbe": g.ecc_errors_double_bit, "nvlink_errors": g.nvlink_errors,
+            "health": g.health.value,
+        }
+        for g in gpus
+    ]
+
+    result = DiagnosisResult(
+        incident_id=f"INC-RB-{str(uuid.uuid4())[:6].upper()}",
+        scenario_id=scenario_id,
+        node=scenario["node"],
+        affected_gpu=scenario["affected_gpu"],
+        pod=scenario["pod"],
+        namespace=scenario["namespace"],
+        diagnosed_at=datetime.now(timezone.utc),
+        investigation_duration_seconds=11.4,
+        severity=Severity(scenario["severity"]),
+        root_cause=scenario["expected_root_cause"],
+        contributing_factors=["Fan at 100% capacity", "ECC double-bit errors require GPU reset", "NVLink errors preceded thermal event"],
+        fix_category=FixCategory(scenario["expected_fix_category"]),
+        remediation_steps=[
+            RemediationStep(step=1, action="Cordon node", command=f"kubectl cordon {scenario['node']}", description="Prevent new pod scheduling on affected node"),
+            RemediationStep(step=2, action="Drain workloads", command=f"kubectl drain {scenario['node']} --ignore-daemonsets", description="Gracefully evict all running pods"),
+            RemediationStep(step=3, action="Reset GPU", command=f"nvidia-smi --id={scenario['affected_gpu']} --gpu-reset", description="Clear uncorrectable ECC errors"),
+            RemediationStep(step=4, action="Uncordon node", command=f"kubectl uncordon {scenario['node']}", description="Re-enable node for scheduling after GPU verified healthy"),
+        ],
+        k8s_patch_yaml=bundle.get("k8s_patch", ""),
+        gpu_metrics_summary={"cluster": metrics.cluster, "node": metrics.node, "gpus": gpu_summary, "unhealthy_gpu_count": sum(1 for g in gpus if g.health.value != "OK")},
+        log_snippets=["CRITICAL GPU 2: ECC DBE detected — cudaErrorECCUncorrectable"],
+        alert_summary=f"GPU incident on {scenario['node']}",
+        agent_trace=["fetch_context: 1 unhealthy GPU", "rag_retrieve: 2 similar incidents", "analyze_signals: ECC+thermal anomaly", f"root_cause: {scenario['severity'].upper()}", "recommend_fix: 4 steps"],
+        confidence=0.93,
+        similar_incidents=[],
+    )
+
+    markdown = _gen(result)
+    filename = generate_runbook_filename(result)
+
+    from fastapi.responses import Response
+    return Response(
+        content=markdown,
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── Day 4: Cluster Scan ────────────────────────────────────────────────────────
+
+@router.post(
+    "/cluster/scan",
+    summary="Scan all GPU nodes and diagnose unhealthy ones",
+    tags=["cluster"],
+)
+async def cluster_scan(cluster: str = "gpu-cluster-prod-01"):
+    """
+    Scan all GPU nodes in the cluster in parallel.
+    Automatically diagnoses any node with unhealthy GPUs.
+
+    In mock mode: simulates a 3-node cluster (node-01 healthy, node-02 warning, node-03 critical).
+    In live mode: discovers nodes via kubectl label selector nvidia.com/gpu.
+
+    Returns per-node health status + full DiagnosisResult for each unhealthy node.
+    This is the single most impressive demo endpoint.
+    """
+    from app.services.cluster_scanner import scan_cluster
+    return await scan_cluster(cluster)
+
+
+@router.get(
+    "/cluster/nodes",
+    summary="List all discovered GPU nodes",
+    tags=["cluster"],
+)
+async def list_cluster_nodes():
+    """Discover and list all GPU-capable nodes in the cluster."""
+    from app.services.cluster_scanner import _get_cluster_nodes
+    nodes = await _get_cluster_nodes()
+    return {"nodes": nodes, "count": len(nodes)}

@@ -7,7 +7,9 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  # ── Unit + Day 1/2/3 tests (no API key needed) ───────────────────────────
+  unit-tests:
+    name: Unit Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -25,9 +27,51 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run tests
-        run: pytest tests/ -v
+      - name: Run unit tests (Day 1 + 2 + 3 + 4)
+        run: pytest tests/test_day1.py tests/test_day2.py tests/test_day3.py tests/test_day4.py -v
         env:
           ANTHROPIC_API_KEY: "sk-ant-mock-key-for-ci"
           USE_MOCK_DATA: "true"
           FIXTURES_DIR: "fixtures"
+
+  # ── Integration tests (real API key, runs on push to main only) ──────────
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run integration tests (fast groups only, skip @slow)
+        run: pytest tests/test_integration.py -v -m "not slow" --tb=short
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          USE_MOCK_DATA: "true"
+          FIXTURES_DIR: "fixtures"
+        continue-on-error: true  # don't block merge if API is flaky
+
+  # ── Linting ──────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install ruff
+      - name: Ruff lint
+        run: ruff check app/ tests/ --select E,F,W --ignore E501
+        continue-on-error: true

@@ -51,5 +51,12 @@ class Settings(BaseSettings):
     # ── Analytics (Day 3) ────────────────────────────────────────────────────
     analytics_enabled: bool = True
 
+    # ── API Auth + Rate Limiting (Day 4) ─────────────────────────────────────
+    api_key: str = ""
+    rate_limit_per_minute: int = 60
+
+    # ── Job Queue (Day 4) ─────────────────────────────────────────────────────
+    job_queue_max_size: int = 100
+
 
 settings = Settings()
