@@ -8,6 +8,8 @@
 [![LLM](https://img.shields.io/badge/LLM-Powered-FF6B35?style=flat-square)](https://github.com/ArchanaChetan07/AI-Infrastructure-Copilot)
 [![MLOps](https://img.shields.io/badge/MLOps-Automation-6E40C9?style=flat-square)](https://github.com/ArchanaChetan07/AI-Infrastructure-Copilot)
 [![GPU](https://img.shields.io/badge/NVIDIA-GPU%20Management-76B900?style=flat-square&logo=nvidia&logoColor=white)](https://developer.nvidia.com)
+[![LangChain](https://img.shields.io/badge/LangChain-RAG-1C3C3C?style=flat-square)](https://langchain.com)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)](Dockerfile)
 
 *"How many GPU replicas do I need for 1000 concurrent users?" — ask the copilot.*
 
@@ -50,9 +52,7 @@ Copilot: "Most likely cause: KV cache overflow. Check:
           2. vllm:gpu_cache_usage_perc — if hitting 100%, preemptions
              cascade into full OOM
           Fix: reduce --gpu-memory-utilization from 0.95 to 0.85,
-          or reduce --max-model-len to free KV cache headroom.
-          Run: kubectl set env deployment/vllm-engine
-               VLLM_GPU_MEMORY_UTILIZATION=0.85 -n llm-inference"
+          or reduce --max-model-len to free KV cache headroom."
 ```
 
 ### Helm configuration generation
@@ -119,6 +119,7 @@ RAG               LangChain + FAISS vector store
 Knowledge base    vLLM docs, K8s docs, GPU spec sheets (chunked + embedded)
 Output parsing    Pydantic structured outputs → YAML / kubectl commands
 Interface         CLI + optional web UI
+Tests             pytest · Docker
 ```
 
 ---
@@ -152,16 +153,29 @@ python copilot.py
 
 ---
 
-## Related projects
+## Part of the vLLM Observability Ecosystem
 
-- **[KubeInfer](https://github.com/ArchanaChetan07/KubeInfer)** — the platform this copilot helps you configure and manage
-- **[KV Cache Profiler](https://github.com/ArchanaChetan07/KV-Cache-Profiler-)** — deep-dive GPU memory analysis
-- **[LLM Benchmarking Dashboard](https://github.com/ArchanaChetan07/LLM-Inference-Benchmarking-Dashboard)** — real-time TTFT/TPOT/E2EL metrics
+| Project | What it does |
+|---------|-------------|
+| **[AI Infrastructure Copilot](https://github.com/ArchanaChetan07/AI-Infrastructure-Copilot)** ← you are here | Conversational GPU capacity planning · Helm config generation · vLLM diagnosis |
+| **[KubeInfer](https://github.com/ArchanaChetan07/KubeInfer)** | Production K8s deployment · queue-depth HPA · GitOps · 12 alert rules |
+| **[AI Inference Observability Platform](https://github.com/ArchanaChetan07/ai-inference-observability-platform)** | FastAPI proxy · TTFT/TBT/E2E · Prometheus · Grafana · OpenTelemetry · 48 tests |
+| **[KV Cache Profiler](https://github.com/ArchanaChetan07/KV-Cache-Profiler-)** | Real-time GPU KV cache hit rate · eviction · memory pressure |
+| **[LLM Benchmarking Dashboard](https://github.com/ArchanaChetan07/LLM-Inference-Benchmarking-Dashboard)** | Live TTFT/TPOT/ITL/E2EL charts · DCGM GPU metrics |
 
 ---
 
-## Author
+## License
 
-**Archana Suresh Patil** — MLOps & AI Infrastructure Engineer  
-MS Data Science · University of San Diego · GPA 3.9  
-📬 apatil@sandiego.edu · [LinkedIn](https://linkedin.com/in/archana-suresh-patil-792213245) · [GitHub](https://github.com/ArchanaChetan07)
+[MIT](LICENSE)
+
+---
+
+<div align="center">
+
+**Archana Suresh Patil** — ML Platform & MLOps Engineer · Sunnyvale, CA  
+[LinkedIn](https://linkedin.com/in/archana-suresh-patil-792213245) · [GitHub](https://github.com/ArchanaChetan07) · Open to full-time · No sponsorship needed
+
+**[⭐ Star this repo](https://github.com/ArchanaChetan07/AI-Infrastructure-Copilot)** if it helps your LLM infrastructure decisions.
+
+</div>
